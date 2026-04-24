@@ -9,6 +9,7 @@ import pytz
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 from handlers import pending_confirmations
+from claude_client import generate_reminder_text
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 await context.bot.send_message(
                     chat_id=owner_id,
-                    text=f"Heads up — <b>{_esc(task['task'])}</b> is due in about 30 minutes.",
+                    text=generate_reminder_text(task['task'], task.get('due_date', ''), 'due_30min', task.get('notify', ''), task['owner']),
                     parse_mode=ParseMode.HTML
                 )
                 notion.mark_pre_reminder_sent(task["id"])
@@ -74,7 +75,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.send_message(
                 chat_id=owner_id,
-                text=f"Reminder: <b>{_esc(task['task'])}</b>. Reply 'done' once it's handled.",
+                text=generate_reminder_text(task['task'], task.get('due_date', ''), 'due_now', task.get('notify', ''), task['owner']),
                 parse_mode=ParseMode.HTML
             )
             pending_confirmations[owner_id] = {
@@ -269,14 +270,13 @@ async def send_todo_nudges(context: ContextTypes.DEFAULT_TYPE) -> None:
     for task in overdue:
         days = _days_overdue(task["due_date"], now_manila)
         suffix = f"{days}d overdue" if days else "overdue"
-        await nudge(task, f"Still open ({suffix}): <b>{_esc(task['task'])}</b>. Reply 'done' to close it out.")
+        await nudge(task, generate_reminder_text(task['task'], task.get('due_date', ''), 'overdue', task.get('notify', ''), task['owner']))
 
     for task in due_today:
-        await nudge(task, f"Due today: <b>{_esc(task['task'])}</b>. Any progress? Reply 'done' once it's handled.")
+        await nudge(task, generate_reminder_text(task['task'], task.get('due_date', ''), 'due_today', task.get('notify', ''), task['owner']))
 
     for task in due_this_week:
-        due_label = _fmt_task_date(task["due_date"], now_manila)
-        await nudge(task, f"Due {_esc(due_label)}: <b>{_esc(task['task'])}</b>. Reply 'done' once it's handled.")
+        await nudge(task, generate_reminder_text(task['task'], task.get('due_date', ''), 'upcoming', task.get('notify', ''), task['owner']))
 
 
 async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:

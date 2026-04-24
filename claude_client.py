@@ -21,7 +21,7 @@ Always use full names "Jaime" and "Denise" in JSON fields — never nicknames.
 
 Timezone: All dates and times are Asia/Manila (PHT, UTC+8) unless the user specifies otherwise. Return due_date in ISO 8601 with +08:00 offset, e.g. "2026-04-22T10:00:00+08:00".
 
-Personality: Jarvis from Iron Man (2008). Precise, dry, slightly witty, caring. Never over-explains. Efficient and respectful. Never robotic, never sycophantic.
+Personality: Jarvis from Iron Man (2008). Precise, dry, slightly witty, caring. Never over-explains. Efficient and respectful. Never robotic, never sycophantic. Address Jaime and Denise as "boss" — naturally, not robotically. Use it in confirmations, reminders, clarifications, digests where it fits. Examples: "On it, boss." "Noted, boss — what time?" "Heads up, boss."
 
 You must return a valid JSON object with exactly these fields:
 {
@@ -193,3 +193,59 @@ def _fallback_response(sender_id: int) -> dict:
         "date_to": None,
         "message_to_user": "I seem to have hit a snag. Could you rephrase that?"
     }
+
+
+def generate_reminder_text(task_name: str, due_date_str: str, urgency: str, notify: str, owner: str) -> str:
+    """Generate a single Tony-voice reminder sentence via Claude Haiku."""
+    import pytz
+    from datetime import datetime as _dt
+    due_label = ""
+    if due_date_str:
+        try:
+            d = _dt.fromisoformat(due_date_str).astimezone(pytz.timezone("Asia/Manila"))
+            due_label = d.strftime("%b %-d at %-I:%M %p") if (d.hour or d.minute) else d.strftime("%b %-d")
+        except Exception:
+            due_label = due_date_str
+
+    urgency_map = {
+        "overdue":   "This task is overdue.",
+        "due_today": "This task is due today.",
+        "due_now":   "This task is due right now.",
+        "due_30min": "This task is due in about 30 minutes.",
+        "upcoming":  f"This task is coming up{(' on ' + due_label) if due_label else ''}.",
+    }
+    urgency_desc = urgency_map.get(urgency, "This task needs attention.")
+    denise_note = " Denise is also on this." if notify == "Both" and owner != "Denise" else ""
+
+    prompt = f"""Write a one-sentence reminder in Tony's voice (Jarvis from Iron Man — dry, caring, precise).
+
+Task: {task_name}
+{urgency_desc}{denise_note}
+
+Rules:
+- One sentence maximum
+- Vary phrasing — don't use the same structure every time
+- Overdue: slightly pointed tone. Upcoming/30min: lighter touch
+- NEVER say "Reply done to close it out" or anything about how to respond
+- "boss" used naturally when it fits, not forced every time
+- Wrap the task name in <b>task name</b> using Telegram HTML
+- Only mention Denise if the note above says she's involved
+- Output only the reminder sentence, nothing else"""
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.warning(f"generate_reminder_text failed: {e}")
+        esc = json.dumps(task_name)[1:-1]
+        fallbacks = {
+            "overdue":   f"Still open — <b>{esc}</b>. This one's been waiting.",
+            "due_today": f"<b>{esc}</b> is due today.",
+            "due_now":   f"<b>{esc}</b> is due right now.",
+            "due_30min": f"Heads up — <b>{esc}</b> is due in about 30 minutes.",
+        }
+        return fallbacks.get(urgency, f"<b>{esc}</b> is coming up.")
