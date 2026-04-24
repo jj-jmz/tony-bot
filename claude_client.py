@@ -34,6 +34,8 @@ You must return a valid JSON object with exactly these fields:
   "notes": "string or null — any notes, context, or updates the user wants to attach to the task",
   "group": "string or null — optional project/category label. ONLY use what the user explicitly states. NEVER infer from task content. If user says 'no group', 'none', or 'without a group', set to null — never the string 'None'.",
   "type": "Event or To-do",
+  "date_from": "ISO 8601 date string or null — for STATUS_REQUEST with a date range reference, set the start of the range",
+  "date_to": "ISO 8601 date string or null — for STATUS_REQUEST with a date range reference, set the end of the range",
   "message_to_user": "Tony's reply in Jarvis tone — concise, dry, no fluff. Use Telegram HTML formatting: <b>task names</b> in bold, <i>status values</i> in italic, <u>Section:</u> headers underlined for multi-part replies, ─────────────── as a divider between sections. Never use MarkdownV2 syntax."
 }
 
@@ -41,7 +43,7 @@ Intent classification rules:
 - SET_REMINDER: task, owner, AND due_date are all present and unambiguous — create the task
 - CLARIFY: ANY required field is missing OR multiple events/tasks detected in one message — list ALL items/missing fields in ONE message, never one at a time
 - MARK_DONE: user wants to mark a task complete — always confirm the specific task before acting
-- CONFIRM_ACTION: user has confirmed a pending MARK_DONE or UPDATE_TASK
+- CONFIRM_ACTION: user has confirmed a pending MARK_DONE or UPDATE_TASK. ONLY set this intent when the user explicitly says yes / confirm / correct / go ahead / yep in direct response to a Tony confirmation question. Casual phrases like "ok", "ok thank you", "thank you", "noted", "got it", "sounds good", "great", "perfect" must NEVER trigger CONFIRM_ACTION — classify those as UNKNOWN instead.
 - UPDATE_TASK: user wants to change task details (time, owner, notes)
 - STATUS_REQUEST: user asking for current status of a task (read-only, no Notion write)
 - DIGEST: user asking for an overview of the week, what's coming up, what's on the schedule, or the daily briefing.
@@ -49,6 +51,7 @@ Intent classification rules:
   - If phrased with "we/us/our/both" ("what do we need to do", "what's on our plate", "our tasks", "what are we doing") → set owner to "Both"
   - Otherwise leave owner null (full unfiltered digest)
 - STATUS_REQUEST with group: if user asks "how is [project] going" or "what's left on [group]" — set task=null, group=[project name]
+- STATUS_REQUEST with date range: if user asks "do we have events in May", "what's on next week", "anything this weekend", "events on April 25" — set date_from and date_to for the referenced range. Examples: "in May" → date_from="2026-05-01T00:00:00+08:00", date_to="2026-05-31T23:59:59+08:00". "Next week" → compute Monday through Sunday of the next calendar week. "This weekend" → coming Saturday 00:00 through Sunday 23:59.
 - REQUEST_UPDATE: user asking Tony to ping the other person for a status update
 - SNOOZE: user wants to defer a reminder to a later time
 - DELETE_TASK: user wants to remove/delete a task entirely — triggers on: "delete", "remove", "get rid of", "cancel [task name]", "drop [task name]"
@@ -61,6 +64,9 @@ Ownership rules:
 - "we", "us", "our", "both of us", "the two of us", "together" → owner is the sender, notify is "Both" — never CLARIFY for ownership in this case
 - owner is ALWAYS a single person (Jaime or Denise), NEVER "Both" — "assigned to both" or "for both of us" means notify=Both, not owner=Both
 - Sender Telegram ID always determines created_by
+
+MARK_DONE ownership rule:
+- If the message says "for [name]" (e.g., "mark dinner done for Denise", "complete the gym session for Jaime"), this indicates WHOSE task to search for — set owner=[name]. Do NOT interpret "for [name]" as a request to reassign ownership. Only use UPDATE_TASK for reassignment when the user explicitly says "reassign", "transfer", or "change owner to".
 
 Type classification rules:
 - Event: has a specific time, one-time occurrence — appointments, sessions, reservations, meetings, calls scheduled at a fixed time
@@ -106,6 +112,9 @@ def parse_intent(message_text: str, sender_id: int) -> dict:
                 state_context += f"- Notify: {state['notify']}\n"
             if state.get("group"):
                 state_context += f"- Group: {state['group']}\n"
+            # Bug 5: signal to Claude that we're mid-clarify so it classifies correctly
+            if state.get("awaiting_clarify"):
+                state_context += "- Status: User was providing missing fields for a NEW task (not yet in Notion). If this message supplies the missing info, classify as SET_REMINDER — NOT UPDATE_TASK.\n"
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
@@ -154,6 +163,12 @@ def parse_intent(message_text: str, sender_id: int) -> dict:
                 state["notify"] = result["notify"]
             if result.get("group"):
                 state["group"] = result["group"]
+            # Bug 5: track clarify state; clear it once task is created
+            if result["intent"] == "CLARIFY":
+                state["awaiting_clarify"] = True
+            elif result["intent"] in ("SET_REMINDER", "UNKNOWN"):
+                state.pop("awaiting_clarify", None)
+                state.pop("draft_task_id", None)
             conversation_state[sender_id] = state
 
         return result
@@ -174,5 +189,7 @@ def _fallback_response(sender_id: int) -> dict:
         "created_by": created_by,
         "notify": created_by,
         "due_date": None,
+        "date_from": None,
+        "date_to": None,
         "message_to_user": "I seem to have hit a snag. Could you rephrase that?"
     }

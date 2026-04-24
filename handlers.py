@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import logging
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
@@ -18,7 +20,15 @@ GROUP_ID = int(os.environ.get("TELEGRAM_GROUP_ID", -1003856456479))
 # pending_confirmations[user_id] = {"action": str, "task_id": str, "task_name": str, ...}
 pending_confirmations: dict[int, dict] = {}
 
-_CONFIRMATIONS = {"yes", "yeah", "yep", "confirm", "correct", "ok", "okay", "sure", "do it", "confirmed", "yup", "please", "go ahead", "yes please", "yeah please", "do it please", "sounds good", "looks good", "perfect", "great"}
+# Bug 3: removed ambiguous terms (ok, okay, sure, great, perfect, sounds good, looks good)
+# and dropped the startswith check — only exact match triggers confirmation
+_CONFIRMATIONS = {
+    "yes", "yeah", "yep", "yup",
+    "confirm", "confirmed", "correct",
+    "do it", "go ahead",
+    "yes please", "yeah please",
+    "do it please", "please do it",
+}
 _CANCELLATIONS = {"no", "nope", "cancel", "nevermind", "never mind", "stop", "abort", "nah", "forget it", "forget that", "drop it", "skip it", "leave it", "ignore that", "don't", "dont", "actually no", "actually never mind", "scratch that", "disregard"}
 
 
@@ -48,20 +58,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = message.text.strip()
 
+    # Bug 5: restore draft context from Notion if in-memory state is empty (restart recovery)
+    from claude_client import conversation_state
+    if sender_id not in conversation_state or not conversation_state[sender_id].get("awaiting_clarify"):
+        try:
+            draft = notion.get_draft_for_user(_sender_name(sender_id))
+            if draft:
+                state = {k: draft[k] for k in ("task", "owner", "due_date", "notify", "group") if draft.get(k)}
+                state["awaiting_clarify"] = True
+                state["draft_task_id"] = draft.get("draft_task_id")
+                conversation_state[sender_id] = state
+        except Exception as e:
+            logger.warning(f"Draft context restore failed: {e}")
+
     if sender_id in pending_confirmations:
         lower = text.lower()
         pending = pending_confirmations[sender_id]
 
         if _is_cancellation(lower):
             del pending_confirmations[sender_id]
-            from claude_client import conversation_state
             conversation_state.pop(sender_id, None)
             await message.reply_text("Noted. Standing down.", parse_mode=ParseMode.HTML)
             return
         if pending.get("action") == "select_task":
             await _handle_selection(update, context, sender_id, text)
             return
-        if lower in _CONFIRMATIONS or any(lower.startswith(c) for c in _CONFIRMATIONS):
+        # Bug 3: exact match only, no startswith
+        if lower in _CONFIRMATIONS:
             await _execute_pending(update, context, sender_id)
             return
 
@@ -118,6 +141,21 @@ async def _handle_set_reminder(data: dict, update: Update, context: ContextTypes
                 logger.warning(f"Conflict check failed: {ce}")
 
         notion.create_task(task, owner, notify, due_date, source, created_by, task_type, group)
+
+        # Bug 5: clear any active draft now that task is created
+        try:
+            from claude_client import conversation_state
+            state = conversation_state.get(update.message.from_user.id, {})
+            draft_id = state.get("draft_task_id")
+            if not draft_id:
+                draft = notion.get_draft_for_user(created_by)
+                if draft:
+                    draft_id = draft.get("draft_task_id")
+            if draft_id:
+                notion.clear_draft(draft_id)
+        except Exception as e:
+            logger.warning(f"Could not clear draft after task creation: {e}")
+
         await update.message.reply_text(
             (data.get("message_to_user") or f"Noted. <b>{_esc(task)}</b> is logged.") + conflict_warning,
             parse_mode=ParseMode.HTML
@@ -144,6 +182,19 @@ async def _handle_clarify(data: dict, update: Update, context: ContextTypes.DEFA
         parse_mode=ParseMode.HTML
     )
 
+    # Bug 5: persist partial data as Draft for restart-survival
+    sender_id = update.message.from_user.id
+    created_by = data.get("created_by") or _sender_name(sender_id)
+    partial = {k: data.get(k) for k in ("task", "owner", "due_date", "notify", "group", "type") if data.get(k)}
+    if partial.get("task"):
+        try:
+            existing = notion.get_draft_for_user(created_by)
+            if existing and existing.get("draft_task_id"):
+                notion.clear_draft(existing["draft_task_id"])
+            notion.create_draft_task(partial, created_by)
+        except Exception as e:
+            logger.warning(f"Could not create draft task: {e}")
+
 
 async def _handle_mark_done(data: dict, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sender_id = update.message.from_user.id
@@ -167,6 +218,11 @@ async def _handle_mark_done(data: dict, update: Update, context: ContextTypes.DE
             "task_name": task["task"],
             "owner": owner,
         }
+        # Bug 1: persist to Notion for restart-survival
+        try:
+            notion.set_pending_action(task["id"], json.dumps({"action": "mark_done", "owner": owner}))
+        except Exception as e:
+            logger.warning(f"set_pending_action failed: {e}")
         await update.message.reply_text(
             data.get("message_to_user") or
             f"Found it — <b>{_esc(task['task'])}</b> (<i>{_esc(task['status'])}</i>). Mark as done? Reply yes to confirm.",
@@ -210,6 +266,11 @@ async def _handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "task_name": task["task"],
         "owner": pending["owner"],
     }
+    # Bug 1: persist selected task's pending action
+    try:
+        notion.set_pending_action(task["id"], json.dumps({"action": next_action, "owner": pending["owner"]}))
+    except Exception as e:
+        logger.warning(f"set_pending_action failed: {e}")
     await update.message.reply_text(
         f"Got it — <b>{_esc(task['task'])}</b> (<i>{_esc(task['status'])}</i>). Confirm? Reply yes to proceed.",
         parse_mode=ParseMode.HTML
@@ -219,6 +280,19 @@ async def _handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 async def _handle_confirm_action(data: dict, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sender_id = update.message.from_user.id
     if sender_id in pending_confirmations:
+        await _execute_pending(update, context, sender_id)
+        return
+
+    # Bug 1: memory miss — try Notion fallback (survives restarts)
+    owner = _sender_name(sender_id)
+    try:
+        action_data = notion.get_pending_action_for_user(owner)
+    except Exception as e:
+        logger.warning(f"get_pending_action_for_user failed: {e}")
+        action_data = None
+
+    if action_data:
+        pending_confirmations[sender_id] = action_data
         await _execute_pending(update, context, sender_id)
     else:
         await update.message.reply_text(
@@ -262,6 +336,11 @@ async def _handle_update_task(data: dict, update: Update, context: ContextTypes.
         "task_name": task["task"],
         "fields": fields,
     }
+    # Bug 1: persist to Notion for restart-survival
+    try:
+        notion.set_pending_action(task["id"], json.dumps({"action": "update_task", "fields": fields}))
+    except Exception as e:
+        logger.warning(f"set_pending_action failed: {e}")
     await update.message.reply_text(
         data.get("message_to_user") or
         f"Ready to update <b>{_esc(task['task'])}</b>. Confirm? Reply yes to proceed.",
@@ -274,6 +353,35 @@ async def _handle_status_request(data: dict, update: Update, context: ContextTyp
     task_name = data.get("task")
     group = data.get("group")
     owner = data.get("owner") or _sender_name(sender_id)
+    date_from_str = data.get("date_from")
+    date_to_str = data.get("date_to")
+
+    # Bug 4: handle date range queries ("any events in May?", "what's next week?")
+    if date_from_str and date_to_str and not task_name and not group:
+        try:
+            df = datetime.fromisoformat(date_from_str).astimezone(timezone.utc)
+            dt = datetime.fromisoformat(date_to_str).astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            await update.message.reply_text("Couldn't parse that date range. Could you rephrase?", parse_mode=ParseMode.HTML)
+            return
+        all_results = notion.get_tasks_due(df, dt)
+        explicit_owner = data.get("owner")
+        if explicit_owner and explicit_owner != "Both":
+            all_results = [r for r in all_results if r["owner"] == explicit_owner]
+        if not all_results:
+            await update.message.reply_text(
+                data.get("message_to_user") or "Nothing scheduled for that period.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        listing = "\n".join(
+            f"• <b>{_esc(r['task'])}</b> — <i>{_esc(r['status'])}</i>, {_esc(r['owner'])}" +
+            (f", due {_esc(_fmt_due(r['due_date']))}" if r.get('due_date') else "")
+            for r in all_results[:10]
+        )
+        header = data.get("message_to_user") or "Here's what's scheduled:"
+        await update.message.reply_text(f"{header}\n{listing}", parse_mode=ParseMode.HTML)
+        return
 
     if group and not task_name:
         results = notion.get_tasks_by_group(group)
@@ -407,6 +515,11 @@ async def _handle_delete_task(data: dict, update: Update, context: ContextTypes.
             "task_name": task["task"],
             "owner": owner,
         }
+        # Bug 1: persist to Notion for restart-survival
+        try:
+            notion.set_pending_action(task["id"], json.dumps({"action": "delete_task"}))
+        except Exception as e:
+            logger.warning(f"set_pending_action failed: {e}")
         await update.message.reply_text(
             f"About to delete <b>{_esc(task['task'])}</b> (<i>{_esc(task['status'])}</i>). This can't be undone. Confirm?",
             parse_mode=ParseMode.HTML
@@ -435,6 +548,13 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cleared = sender_id in pending_confirmations or sender_id in conversation_state
     pending_confirmations.pop(sender_id, None)
     conversation_state.pop(sender_id, None)
+    # Bug 5: clear any active draft
+    try:
+        draft = notion.get_draft_for_user(_sender_name(sender_id))
+        if draft and draft.get("draft_task_id"):
+            notion.clear_draft(draft["draft_task_id"])
+    except Exception as e:
+        logger.warning(f"Could not clear draft on cancel: {e}")
     msg = "Slate wiped. What's next?" if cleared else "Nothing in progress to cancel."
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
@@ -450,6 +570,13 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, s
     pending = pending_confirmations.pop(sender_id)
     action = pending["action"]
     task_name = pending.get("task_name", "the task")
+
+    # Bug 1: clear Notion pending_action regardless of which action executes
+    if pending.get("task_id"):
+        try:
+            notion.clear_pending_action(pending["task_id"])
+        except Exception as e:
+            logger.warning(f"clear_pending_action failed: {e}")
 
     try:
         if action == "mark_done":

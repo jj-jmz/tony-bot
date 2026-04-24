@@ -16,6 +16,8 @@ NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
 TASKS_DB = os.environ.get("NOTION_TASKS_DB_ID", "346ff59abbff808baafcf114c2b618ac")
 UPDATES_DB = os.environ.get("NOTION_UPDATES_DB_ID", "346ff59abbff8095b7b2c4b8698ea070")
 
+_STOPWORDS = {"the", "a", "an", "at", "for", "with", "on", "in", "to", "of", "and", "or", "by", "is", "are", "was", "were"}
+
 
 def _query_database(db_id: str, filter_config: dict) -> list[dict]:
     """Query Notion database using REST API directly."""
@@ -69,10 +71,27 @@ def search_tasks(task_name: str | None, owner: str, statuses: list[str]) -> list
         ]
     }
     results = _query_database(TASKS_DB, query_filter)
-    if task_name:
-        words = task_name.lower().split()
-        results = [r for r in results if all(w in _get_title(r).lower() for w in words)]
-    return [_summarize(r) for r in results]
+    if not task_name:
+        return [_summarize(r) for r in results]
+
+    name_lower = task_name.lower().strip()
+    words = name_lower.split()
+    meaningful_words = [w for w in words if w not in _STOPWORDS]
+
+    scored = []
+    for r in results:
+        title = _get_title(r).lower()
+        if title == name_lower:
+            scored.append((0, r))
+        elif name_lower in title or title in name_lower:
+            scored.append((1, r))
+        elif words and all(w in title for w in words):
+            scored.append((2, r))
+        elif meaningful_words and any(w in title for w in meaningful_words):
+            scored.append((3, r))
+
+    scored.sort(key=lambda x: x[0])
+    return [_summarize(r) for _, r in scored]
 
 
 def delete_task(task_id: str) -> dict:
@@ -208,7 +227,6 @@ def get_task_status(task_name: str | None, owner: str | None) -> dict | None:
     if owner:
         results = search_tasks(task_name, owner, ["Pending", "In Progress", "Snoozed", "Awaiting Confirmation"])
     else:
-        # search across all owners
         q = {"property": "Tasks", "title": {"contains": task_name}} if task_name else {}
         raw = _query_database(TASKS_DB, q)
         results = [_summarize(r) for r in raw]
@@ -253,6 +271,102 @@ def log_update_request(task_id: str, requested_by: str) -> dict:
             "Requested At": {"date": {"start": _now_iso()}},
         }
     )
+
+
+# ── Pending action persistence (Bug 1) ───────────────────────────────────────
+# Requires "Pending Action" rich_text property in Notion Tasks DB.
+
+def set_pending_action(task_id: str, action_json: str) -> None:
+    try:
+        notion.pages.update(
+            page_id=task_id,
+            properties={"Pending Action": {"rich_text": [{"text": {"content": action_json[:2000]}}]}}
+        )
+    except Exception as e:
+        logger.warning(f"set_pending_action failed (add 'Pending Action' rich_text to Notion Tasks DB): {e}")
+
+
+def clear_pending_action(task_id: str) -> None:
+    try:
+        notion.pages.update(
+            page_id=task_id,
+            properties={"Pending Action": {"rich_text": []}}
+        )
+    except Exception as e:
+        logger.warning(f"clear_pending_action failed: {e}")
+
+
+def get_pending_action_for_user(owner: str) -> dict | None:
+    results = _query_database(TASKS_DB, {
+        "and": [
+            {"property": "Owner", "select": {"equals": owner}},
+            {"property": "Pending Action", "rich_text": {"is_not_empty": True}},
+        ]
+    })
+    if not results:
+        return None
+    page = results[0]
+    try:
+        raw = page["properties"]["Pending Action"]["rich_text"][0]["text"]["content"]
+        data = json.loads(raw)
+        data["task_id"] = page["id"]
+        data["task_name"] = _get_title(page)
+        return data
+    except Exception as e:
+        logger.warning(f"get_pending_action_for_user parse failed: {e}")
+        return None
+
+
+# ── Draft task persistence (Bug 5) ───────────────────────────────────────────
+# Requires "Draft Data" rich_text property and "Draft" Status option in Notion Tasks DB.
+
+def create_draft_task(partial_data: dict, created_by: str) -> dict:
+    task_name = partial_data.get("task") or "(Draft)"
+    owner = partial_data.get("owner") or created_by
+    props = {
+        "Tasks": {"title": [{"text": {"content": task_name}}]},
+        "Owner": {"select": {"name": owner}},
+        "Status": {"select": {"name": "Draft"}},
+        "Created By": {"select": {"name": created_by}},
+        "Created At": {"date": {"start": _now_iso()}},
+        "Type": {"select": {"name": partial_data.get("type") or "To-do"}},
+        "Pre-Reminder Sent": {"checkbox": False},
+        "Draft Data": {"rich_text": [{"text": {"content": json.dumps(partial_data)[:2000]}}]},
+    }
+    if partial_data.get("notify"):
+        props["Notify"] = {"multi_select": [{"name": n} for n in _parse_notify(partial_data["notify"])]}
+    if partial_data.get("due_date"):
+        props["Due Date"] = {"date": {"start": partial_data["due_date"]}}
+    return notion.pages.create(parent={"database_id": TASKS_DB}, properties=props)
+
+
+def get_draft_for_user(created_by: str) -> dict | None:
+    results = _query_database(TASKS_DB, {
+        "and": [
+            {"property": "Status", "select": {"equals": "Draft"}},
+            {"property": "Created By", "select": {"equals": created_by}},
+        ]
+    })
+    if not results:
+        return None
+    page = results[0]
+    try:
+        raw = page["properties"].get("Draft Data", {}).get("rich_text", [])
+        if not raw:
+            return None
+        data = json.loads(raw[0]["text"]["content"])
+        data["draft_task_id"] = page["id"]
+        return data
+    except Exception as e:
+        logger.warning(f"get_draft_for_user parse failed: {e}")
+        return None
+
+
+def clear_draft(task_id: str) -> None:
+    try:
+        notion.pages.update(page_id=task_id, archived=True)
+    except Exception as e:
+        logger.warning(f"clear_draft failed: {e}")
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
