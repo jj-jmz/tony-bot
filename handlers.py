@@ -597,6 +597,7 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, s
                 logger.warning(f"Could not notify other user ({other_id}): {notify_err}")
         elif action == "update_task":
             notion.update_task_fields(pending["task_id"], pending.get("fields", {}))
+            notion.update_task_status(pending["task_id"], "Pending")
             await update.message.reply_text(
                 f"Understood. <b>{_esc(task_name)}</b> has been updated.",
                 parse_mode=ParseMode.HTML

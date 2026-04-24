@@ -277,10 +277,14 @@ def log_update_request(task_id: str, requested_by: str) -> dict:
 # Requires "Pending Action" rich_text property in Notion Tasks DB.
 
 def set_pending_action(task_id: str, action_json: str) -> None:
+    """Write pending action JSON and set status to Awaiting Confirmation so the fallback query can find it after a restart."""
     try:
         notion.pages.update(
             page_id=task_id,
-            properties={"Pending Action": {"rich_text": [{"text": {"content": action_json[:2000]}}]}}
+            properties={
+                "Pending Action": {"rich_text": [{"text": {"content": action_json[:2000]}}]},
+                "Status": {"select": {"name": "Awaiting Confirmation"}},
+            }
         )
     except Exception as e:
         logger.warning(f"set_pending_action failed (add 'Pending Action' rich_text to Notion Tasks DB): {e}")
@@ -300,15 +304,17 @@ def get_pending_action_for_user(owner: str) -> dict | None:
     results = _query_database(TASKS_DB, {
         "and": [
             {"property": "Owner", "select": {"equals": owner}},
-            {"property": "Pending Action", "rich_text": {"is_not_empty": True}},
+            {"property": "Status", "select": {"equals": "Awaiting Confirmation"}},
         ]
     })
     if not results:
         return None
     page = results[0]
     try:
-        raw = page["properties"]["Pending Action"]["rich_text"][0]["text"]["content"]
-        data = json.loads(raw)
+        raw = page["properties"].get("Pending Action", {}).get("rich_text", [])
+        if not raw:
+            return None
+        data = json.loads(raw[0]["text"]["content"])
         data["task_id"] = page["id"]
         data["task_name"] = _get_title(page)
         return data
