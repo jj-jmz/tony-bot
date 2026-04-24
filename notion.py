@@ -16,7 +16,6 @@ NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
 TASKS_DB = os.environ.get("NOTION_TASKS_DB_ID", "346ff59abbff808baafcf114c2b618ac")
 UPDATES_DB = os.environ.get("NOTION_UPDATES_DB_ID", "346ff59abbff8095b7b2c4b8698ea070")
 
-_STOPWORDS = {"the", "a", "an", "at", "for", "with", "on", "in", "to", "of", "and", "or", "by", "is", "are", "was", "were"}
 
 
 def _query_database(db_id: str, filter_config: dict) -> list[dict]:
@@ -75,8 +74,8 @@ def search_tasks(task_name: str | None, owner: str, statuses: list[str]) -> list
         return [_summarize(r) for r in results]
 
     name_lower = task_name.lower().strip()
-    words = name_lower.split()
-    meaningful_words = [w for w in words if w not in _STOPWORDS]
+    # Only words 4+ chars count — strips stopwords AND short noise words like "at", "for", "with"
+    meaningful_words = [w for w in name_lower.split() if len(w) >= 4]
 
     scored = []
     for r in results:
@@ -85,10 +84,9 @@ def search_tasks(task_name: str | None, owner: str, statuses: list[str]) -> list
             scored.append((0, r))
         elif name_lower in title or title in name_lower:
             scored.append((1, r))
-        elif words and all(w in title for w in words):
+        elif meaningful_words and all(w in title for w in meaningful_words):
             scored.append((2, r))
-        elif meaningful_words and any(w in title for w in meaningful_words):
-            scored.append((3, r))
+        # tier 4 (any-word match) removed — too broad, causes false positives
 
     scored.sort(key=lambda x: x[0])
     return [_summarize(r) for _, r in scored]
