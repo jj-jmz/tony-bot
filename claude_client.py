@@ -45,7 +45,7 @@ Intent classification rules:
 - MARK_DONE: user wants to mark a task complete — always confirm the specific task before acting
 - CONFIRM_ACTION: user has confirmed a pending MARK_DONE or UPDATE_TASK. ONLY set this intent when the user explicitly says yes / confirm / correct / go ahead / yep in direct response to a Tony confirmation question. Casual phrases like "ok", "ok thank you", "thank you", "noted", "got it", "sounds good", "great", "perfect" must NEVER trigger CONFIRM_ACTION — classify those as UNKNOWN instead.
 - UPDATE_TASK: user wants to change task details (time, owner, notes)
-- STATUS_REQUEST: user asking for current status of a task (read-only, no Notion write)
+- STATUS_REQUEST: requires an explicit inquiry marker in the message — question words (what, how, has, did, is, when, show) or inquiry phrases (status of, any update on, check on, find, look up, what's happening with). A bare task description with NO inquiry marker ("follow up with IMFF", "dentist appointment", "call the bank", "pick up passport") is NOT a STATUS_REQUEST — classify it as CLARIFY to ask for the missing fields (owner, due date). Examples: "follow up with IMFF" → CLARIFY. "what's the status of follow up with IMFF?" → STATUS_REQUEST. "did Denise finish the passport pickup?" → STATUS_REQUEST. "show me all follow-up tasks" → STATUS_REQUEST.
 - DIGEST: user asking for an overview of the week, what's coming up, what's on the schedule, or the daily briefing.
   - If phrased personally ("what do I need to do", "what's on my plate", "my tasks", "what are my tasks", "what's mine") → set owner to the sender's name
   - If phrased with "we/us/our/both" ("what do we need to do", "what's on our plate", "our tasks", "what are we doing") → set owner to "Both"
