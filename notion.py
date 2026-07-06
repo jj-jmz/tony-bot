@@ -274,13 +274,15 @@ def log_update_request(task_id: str, requested_by: str) -> dict:
 # ── Pending action persistence (Bug 1) ───────────────────────────────────────
 # Requires "Pending Action" rich_text property in Notion Tasks DB.
 
-def set_pending_action(task_id: str, action_json: str) -> None:
-    """Write pending action JSON and set status to Awaiting Confirmation so the fallback query can find it after a restart."""
+def set_pending_action(task_id: str, action: dict, prior_status: str) -> None:
+    """Persist a pending action with initiator, prior status, and timestamp
+    so it can be matched to the right confirmer, cancelled, or expired."""
+    payload = {**action, "prior_status": prior_status, "set_at": _now_iso()}
     try:
         notion.pages.update(
             page_id=task_id,
             properties={
-                "Pending Action": {"rich_text": [{"text": {"content": action_json[:2000]}}]},
+                "Pending Action": {"rich_text": [{"text": {"content": json.dumps(payload)[:2000]}}]},
                 "Status": {"select": {"name": "Awaiting Confirmation"}},
             }
         )
@@ -288,37 +290,37 @@ def set_pending_action(task_id: str, action_json: str) -> None:
         logger.warning(f"set_pending_action failed (add 'Pending Action' rich_text to Notion Tasks DB): {e}")
 
 
-def clear_pending_action(task_id: str) -> None:
+def clear_pending_action(task_id: str, restore_status: str | None = None) -> None:
+    """Clear pending action. Pass restore_status on cancel/expiry so the task
+    returns to its prior state; omit it when the confirmed action sets its own status."""
+    props: dict = {"Pending Action": {"rich_text": []}}
+    if restore_status:
+        props["Status"] = {"select": {"name": restore_status}}
     try:
-        notion.pages.update(
-            page_id=task_id,
-            properties={"Pending Action": {"rich_text": []}}
-        )
+        notion.pages.update(page_id=task_id, properties=props)
     except Exception as e:
         logger.warning(f"clear_pending_action failed: {e}")
 
 
-def get_pending_action_for_user(owner: str) -> dict | None:
+def get_pending_action_for_initiator(name: str) -> dict | None:
+    """Match by who STARTED the action, not task owner."""
     results = _query_database(TASKS_DB, {
-        "and": [
-            {"property": "Owner", "select": {"equals": owner}},
-            {"property": "Status", "select": {"equals": "Awaiting Confirmation"}},
-        ]
+        "property": "Status", "select": {"equals": "Awaiting Confirmation"}
     })
-    if not results:
-        return None
-    page = results[0]
-    try:
-        raw = page["properties"].get("Pending Action", {}).get("rich_text", [])
-        if not raw:
-            return None
-        data = json.loads(raw[0]["text"]["content"])
-        data["task_id"] = page["id"]
-        data["task_name"] = _get_title(page)
-        return data
-    except Exception as e:
-        logger.warning(f"get_pending_action_for_user parse failed: {e}")
-        return None
+    for page in results:
+        try:
+            raw = page["properties"].get("Pending Action", {}).get("rich_text", [])
+            if not raw:
+                continue
+            data = json.loads(raw[0]["text"]["content"])
+            if data.get("initiated_by") != name:
+                continue
+            data["task_id"] = page["id"]
+            data["task_name"] = _get_title(page)
+            return data
+        except Exception as e:
+            logger.warning(f"get_pending_action_for_initiator parse failed: {e}")
+    return None
 
 
 # ── Draft task persistence (Bug 5) ───────────────────────────────────────────
@@ -344,6 +346,8 @@ def create_draft_task(partial_data: dict, created_by: str) -> dict:
     return notion.pages.create(parent={"database_id": TASKS_DB}, properties=props)
 
 
+DRAFT_MAX_AGE_MIN = 60
+
 def get_draft_for_user(created_by: str) -> dict | None:
     results = _query_database(TASKS_DB, {
         "and": [
@@ -351,15 +355,24 @@ def get_draft_for_user(created_by: str) -> dict | None:
             {"property": "Created By", "select": {"equals": created_by}},
         ]
     })
-    if not results:
+    fresh = None
+    for page in results:
+        created = _get_date(page["properties"], "Created At")
+        if created and _age_minutes(created) > DRAFT_MAX_AGE_MIN:
+            clear_draft(page["id"])   # self-expire: stale drafts never resurface
+            continue
+        if fresh is None:
+            fresh = page
+        else:
+            clear_draft(page["id"])   # never keep duplicate drafts
+    if not fresh:
         return None
-    page = results[0]
     try:
-        raw = page["properties"].get("Draft Data", {}).get("rich_text", [])
+        raw = fresh["properties"].get("Draft Data", {}).get("rich_text", [])
         if not raw:
             return None
         data = json.loads(raw[0]["text"]["content"])
-        data["draft_task_id"] = page["id"]
+        data["draft_task_id"] = fresh["id"]
         return data
     except Exception as e:
         logger.warning(f"get_draft_for_user parse failed: {e}")
@@ -371,6 +384,42 @@ def clear_draft(task_id: str) -> None:
         notion.pages.update(page_id=task_id, archived=True)
     except Exception as e:
         logger.warning(f"clear_draft failed: {e}")
+
+
+# ── Stale-state expiry sweep (called by the 5-minute poller) ─────────────────
+
+def expire_stale_state(max_age_minutes: int = 60) -> None:
+    """Release tasks stuck in Awaiting Confirmation and archive old Drafts."""
+    for page in _query_database(TASKS_DB, {"property": "Status", "select": {"equals": "Awaiting Confirmation"}}):
+        prior, set_at = "Pending", None
+        try:
+            raw = page["properties"].get("Pending Action", {}).get("rich_text", [])
+            if raw:
+                data = json.loads(raw[0]["text"]["content"])
+                prior = data.get("prior_status") or "Pending"
+                set_at = data.get("set_at")
+        except Exception:
+            pass
+        # No timestamp = legacy dirty state → release immediately; else check age
+        if set_at is None or _age_minutes(set_at) > max_age_minutes:
+            clear_pending_action(page["id"], restore_status=prior)
+            logger.info(f"Expired stale pending action on {page['id']}")
+
+    for page in _query_database(TASKS_DB, {"property": "Status", "select": {"equals": "Draft"}}):
+        created = _get_date(page["properties"], "Created At")
+        if not created or _age_minutes(created) > max_age_minutes:
+            clear_draft(page["id"])
+            logger.info(f"Archived stale draft {page['id']}")
+
+
+def _age_minutes(iso_str: str) -> float:
+    try:
+        then = datetime.fromisoformat(iso_str)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - then).total_seconds() / 60
+    except Exception:
+        return float("inf")
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

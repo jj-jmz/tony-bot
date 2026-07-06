@@ -112,9 +112,10 @@ def parse_intent(message_text: str, sender_id: int) -> dict:
                 state_context += f"- Notify: {state['notify']}\n"
             if state.get("group"):
                 state_context += f"- Group: {state['group']}\n"
-            # Bug 5: signal to Claude that we're mid-clarify so it classifies correctly
             if state.get("awaiting_clarify"):
-                state_context += "- Status: User was providing missing fields for a NEW task (not yet in Notion). If this message supplies the missing info, classify as SET_REMINDER — NOT UPDATE_TASK.\n"
+                state_context += "- Status: User is mid-task-creation (providing missing fields for a NEW task not yet in Notion). If they supply missing info, classify as SET_REMINDER — NOT UPDATE_TASK. If they answer 'yes'/'yeah' to a yes/no question, DO NOT classify as CONFIRM_ACTION — treat it as an affirmative answer and continue the flow.\n"
+            if state.get("last_question"):
+                state_context += f"- Tony's last question to the user: {state['last_question']}\n"
 
         response = client.messages.create(
             model="claude-sonnet-4-6",

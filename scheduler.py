@@ -37,6 +37,11 @@ def setup_scheduler(app) -> None:
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     import notion
+    try:
+        notion.expire_stale_state(max_age_minutes=60)
+    except Exception as e:
+        logger.warning(f"expire_stale_state failed: {e}")
+
     now = datetime.datetime.now(timezone.utc)
     window_start = now - timedelta(hours=1)
 

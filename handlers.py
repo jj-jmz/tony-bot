@@ -47,6 +47,15 @@ def _is_cancellation(text: str) -> bool:
     return False
 
 
+_SOFT_NO = {"no", "nope", "nah", "don't", "dont"}
+
+def _is_hard_cancellation(text: str) -> bool:
+    lower = text.lower().strip()
+    if lower in _SOFT_NO:
+        return False
+    return _is_cancellation(text)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not message.text:
@@ -71,22 +80,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.warning(f"Draft context restore failed: {e}")
 
+    lower = text.lower().strip()
+
+    # P0-4: restart recovery — confirm/cancel word with no in-memory pending →
+    # check Notion for a persisted action initiated by this sender
+    if sender_id not in pending_confirmations and (lower in _CONFIRMATIONS or _is_cancellation(text)):
+        try:
+            action_data = notion.get_pending_action_for_initiator(_sender_name(sender_id))
+            if action_data:
+                pending_confirmations[sender_id] = action_data
+        except Exception as e:
+            logger.warning(f"Pending action recovery failed: {e}")
+
     if sender_id in pending_confirmations:
-        lower = text.lower()
         pending = pending_confirmations[sender_id]
 
-        if _is_cancellation(lower):
+        if _is_cancellation(text):
             del pending_confirmations[sender_id]
             conversation_state.pop(sender_id, None)
+            # P0-1: clear Notion state and restore the task's prior status
+            if pending.get("task_id"):
+                notion.clear_pending_action(pending["task_id"], restore_status=pending.get("prior_status", "Pending"))
             await message.reply_text("Noted. Standing down.", parse_mode=ParseMode.HTML)
             return
         if pending.get("action") == "select_task":
             await _handle_selection(update, context, sender_id, text)
             return
-        # Bug 3: exact match only, no startswith
         if lower in _CONFIRMATIONS:
             await _execute_pending(update, context, sender_id)
             return
+
+    elif _is_hard_cancellation(text):
+        # P0-2: cancellation mid-clarify — kill the draft so it can't resurface.
+        state = conversation_state.pop(sender_id, None)
+        draft_id = (state or {}).get("draft_task_id")
+        try:
+            if not draft_id:
+                draft = notion.get_draft_for_user(_sender_name(sender_id))
+                draft_id = draft.get("draft_task_id") if draft else None
+            if draft_id:
+                notion.clear_draft(draft_id)
+        except Exception as e:
+            logger.warning(f"Draft cancel failed: {e}")
+        if state or draft_id:
+            await message.reply_text("Noted. Standing down.", parse_mode=ParseMode.HTML)
+            return
+        # nothing was in progress — fall through to Claude
 
     parsed = parse_intent(text, sender_id)
     logger.info(f"[{sender_id}] intent={parsed.get('intent')} task={parsed.get('task')!r}")
@@ -182,10 +221,14 @@ async def _handle_clarify(data: dict, update: Update, context: ContextTypes.DEFA
         parse_mode=ParseMode.HTML
     )
 
-    # Bug 5: persist partial data as Draft for restart-survival
+    # Persist partial data as Draft for restart-survival (Bug 5).
+    # Also store last_question so CONFIRM_ACTION can re-route "yes" replies correctly (Bug 1).
     sender_id = update.message.from_user.id
     created_by = data.get("created_by") or _sender_name(sender_id)
     partial = {k: data.get(k) for k in ("task", "owner", "due_date", "notify", "group", "type") if data.get(k)}
+    msg = data.get("message_to_user", "")
+    if msg.rstrip().endswith("?"):
+        partial["last_question"] = msg
     if partial.get("task"):
         try:
             existing = notion.get_draft_for_user(created_by)
@@ -217,12 +260,14 @@ async def _handle_mark_done(data: dict, update: Update, context: ContextTypes.DE
             "task_id": task["id"],
             "task_name": task["task"],
             "owner": owner,
+            "prior_status": task["status"],
         }
         # Bug 1: persist to Notion for restart-survival
-        try:
-            notion.set_pending_action(task["id"], json.dumps({"action": "mark_done", "owner": owner}))
-        except Exception as e:
-            logger.warning(f"set_pending_action failed: {e}")
+        notion.set_pending_action(
+            task["id"],
+            {"action": "mark_done", "owner": owner, "initiated_by": _sender_name(sender_id)},
+            prior_status=task["status"],
+        )
         await update.message.reply_text(
             data.get("message_to_user") or
             f"Found it — <b>{_esc(task['task'])}</b> (<i>{_esc(task['status'])}</i>). Mark as done? Reply yes to confirm.",
@@ -265,12 +310,14 @@ async def _handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "task_id": task["id"],
         "task_name": task["task"],
         "owner": pending["owner"],
+        "prior_status": task["status"],
     }
     # Bug 1: persist selected task's pending action
-    try:
-        notion.set_pending_action(task["id"], json.dumps({"action": next_action, "owner": pending["owner"]}))
-    except Exception as e:
-        logger.warning(f"set_pending_action failed: {e}")
+    notion.set_pending_action(
+        task["id"],
+        {"action": next_action, "owner": pending["owner"], "initiated_by": _sender_name(sender_id)},
+        prior_status=task["status"],
+    )
     await update.message.reply_text(
         f"Got it — <b>{_esc(task['task'])}</b> (<i>{_esc(task['status'])}</i>). Confirm? Reply yes to proceed.",
         parse_mode=ParseMode.HTML
@@ -278,6 +325,12 @@ async def _handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 async def _handle_confirm_action(data: dict, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # P0-3, loop guard: a re-parsed draft that returns CONFIRM_ACTION again must
+    # not re-enter this handler — route it as unknown instead.
+    if data.get("_reparsed"):
+        await _handle_unknown(data, update, context)
+        return
+
     sender_id = update.message.from_user.id
     if sender_id in pending_confirmations:
         await _execute_pending(update, context, sender_id)
@@ -286,19 +339,37 @@ async def _handle_confirm_action(data: dict, update: Update, context: ContextTyp
     # Bug 1: memory miss — try Notion fallback (survives restarts)
     owner = _sender_name(sender_id)
     try:
-        action_data = notion.get_pending_action_for_user(owner)
+        action_data = notion.get_pending_action_for_initiator(_sender_name(sender_id))
     except Exception as e:
-        logger.warning(f"get_pending_action_for_user failed: {e}")
+        logger.warning(f"get_pending_action_for_initiator failed: {e}")
         action_data = None
 
     if action_data:
         pending_confirmations[sender_id] = action_data
         await _execute_pending(update, context, sender_id)
-    else:
-        await update.message.reply_text(
-            "Nothing pending to confirm — I may have restarted. Could you repeat the request?",
-            parse_mode=ParseMode.HTML
-        )
+        return
+
+    # Third fallback: check for an active Draft (user was answering a yes/no question mid-clarify)
+    try:
+        draft = notion.get_draft_for_user(owner)
+        if draft:
+            from claude_client import conversation_state
+            state = {k: draft[k] for k in ("task", "owner", "due_date", "notify", "group") if draft.get(k)}
+            state["awaiting_clarify"] = True
+            if draft.get("last_question"):
+                state["last_question"] = draft["last_question"]
+            conversation_state[sender_id] = state
+            parsed = parse_intent(update.message.text.strip(), sender_id)
+            parsed["_reparsed"] = True
+            await _route(parsed, update, context)
+            return
+    except Exception as e:
+        logger.warning(f"Draft confirm fallback failed: {e}")
+
+    await update.message.reply_text(
+        "Nothing pending to confirm — I may have restarted. Could you repeat the request?",
+        parse_mode=ParseMode.HTML
+    )
 
 
 async def _handle_update_task(data: dict, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -335,12 +406,14 @@ async def _handle_update_task(data: dict, update: Update, context: ContextTypes.
         "task_id": task["id"],
         "task_name": task["task"],
         "fields": fields,
+        "prior_status": task["status"],
     }
     # Bug 1: persist to Notion for restart-survival
-    try:
-        notion.set_pending_action(task["id"], json.dumps({"action": "update_task", "fields": fields}))
-    except Exception as e:
-        logger.warning(f"set_pending_action failed: {e}")
+    notion.set_pending_action(
+        task["id"],
+        {"action": "update_task", "fields": fields, "initiated_by": _sender_name(sender_id)},
+        prior_status=task["status"],
+    )
     await update.message.reply_text(
         data.get("message_to_user") or
         f"Ready to update <b>{_esc(task['task'])}</b>. Confirm? Reply yes to proceed.",
@@ -392,7 +465,7 @@ async def _handle_status_request(data: dict, update: Update, context: ContextTyp
         for r in results:
             status_line = f"  • <b>{_esc(r['task'])}</b> — <i>{_esc(r['status'])}</i> ({_esc(r['owner'])})"
             if r.get("notes"):
-                status_line += f"\n    <i>{_esc(r['notes'])}</i>"
+                status_line += f"\n  ↳ <i>{_esc(r['notes'])}</i>"
             lines.append(status_line)
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
@@ -514,12 +587,14 @@ async def _handle_delete_task(data: dict, update: Update, context: ContextTypes.
             "task_id": task["id"],
             "task_name": task["task"],
             "owner": owner,
+            "prior_status": task["status"],
         }
         # Bug 1: persist to Notion for restart-survival
-        try:
-            notion.set_pending_action(task["id"], json.dumps({"action": "delete_task"}))
-        except Exception as e:
-            logger.warning(f"set_pending_action failed: {e}")
+        notion.set_pending_action(
+            task["id"],
+            {"action": "delete_task", "initiated_by": _sender_name(sender_id)},
+            prior_status=task["status"],
+        )
         await update.message.reply_text(
             f"About to delete <b>{_esc(task['task'])}</b> (<i>{_esc(task['status'])}</i>). This can't be undone. Confirm?",
             parse_mode=ParseMode.HTML
@@ -546,8 +621,18 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sender_id = update.message.from_user.id
     from claude_client import conversation_state
     cleared = sender_id in pending_confirmations or sender_id in conversation_state
-    pending_confirmations.pop(sender_id, None)
+    pending = pending_confirmations.pop(sender_id, None)
     conversation_state.pop(sender_id, None)
+    # P0-1: clear the persisted pending action and restore prior status
+    try:
+        if pending and pending.get("task_id"):
+            notion.clear_pending_action(pending["task_id"], restore_status=pending.get("prior_status", "Pending"))
+        else:
+            action_data = notion.get_pending_action_for_initiator(_sender_name(sender_id))
+            if action_data:
+                notion.clear_pending_action(action_data["task_id"], restore_status=action_data.get("prior_status", "Pending"))
+    except Exception as e:
+        logger.warning(f"Could not clear pending action on cancel: {e}")
     # Bug 5: clear any active draft
     try:
         draft = notion.get_draft_for_user(_sender_name(sender_id))
@@ -597,7 +682,7 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, s
                 logger.warning(f"Could not notify other user ({other_id}): {notify_err}")
         elif action == "update_task":
             notion.update_task_fields(pending["task_id"], pending.get("fields", {}))
-            notion.update_task_status(pending["task_id"], "Pending")
+            notion.update_task_status(pending["task_id"], pending.get("prior_status") or "Pending")
             await update.message.reply_text(
                 f"Understood. <b>{_esc(task_name)}</b> has been updated.",
                 parse_mode=ParseMode.HTML
